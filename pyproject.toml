@@ -1,20 +1,18 @@
-[project]
+[tool.poetry]
 name = "eda-workflow"
 version = "0.1.0"
 description = "Exploratory Data Analysis workflow for consistent first-pass dataset analysis"
-authors = [
-    {name = "Andres Vourakis"}
-]
+authors = ["Andres Vourakis", "Ilse van Herck"]
 readme = "README.md"
-requires-python = ">=3.10,<3.12"
-dependencies = [
-    "pandas (>=2.0.0,<3.0.0)",
-    "langgraph (>=0.2.0,<0.3.0)",
-    "langchain (>=0.3.0,<0.4.0)",
-    "langchain-openai (>=0.2.0,<0.3.0)",
-    "python-dotenv (>=1.1.1,<2.0.0)"
-]
+packages = [{include = "eda_workflow"}]
 
+[tool.poetry.dependencies]
+python = ">=3.10,<3.12"
+pandas = ">=2.0.0,<3.0.0"
+langgraph = ">=0.2.0,<0.3.0"
+langchain = ">=0.3.0,<0.4.0"
+langchain-openai = ">=0.2.0,<0.3.0"
+python-dotenv = ">=1.1.1,<2.0.0"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
