@@ -21,6 +21,24 @@ def load_prompt(filename: str) -> str:
         return f.read()
 
 
+def _get_date_columns(df: pd.DataFrame) -> list[str]:
+    """Return columns that are native datetimes or ISO date strings."""
+    date_cols = df.select_dtypes(include=["datetime", "datetime64"]).columns.tolist()
+
+    iso_date_pattern = r"^\d{4}-\d{2}-\d{2}"
+    for col in df.select_dtypes(include=["object", "string"]).columns:
+        if col in date_cols:
+            continue
+        series = df[col].dropna().astype(str)
+        if series.empty or not series.str.match(iso_date_pattern).all():
+            continue
+        parsed = pd.to_datetime(df[col], format="ISO8601", errors="coerce")
+        if parsed.notna().all():
+            date_cols.append(col)
+
+    return date_cols
+
+
 class EDAWorkflow:
     """
     Exploratory Data Analysis workflow that performs consistent, first-pass analysis of datasets.
@@ -245,16 +263,11 @@ def make_eda_baseline_workflow(
         df_aggregates = {}
         df_aggregates["numeric_sums"] = numeric_sums
 
-        date_cols = df.select_dtypes(include=["datetime", "datetime64"]).columns.tolist()
-        if len(date_cols) == 0:
-            for col in df.select_dtypes(include=["object", "string"]).columns:
-                parsed = pd.to_datetime(df[col], errors="coerce")
-                if parsed.notna().all():
-                    date_cols.append(col)
+        date_cols = _get_date_columns(df)
 
         if len(date_cols) == 1 and len(agg_numeric_cols) > 0:
             date_col = date_cols[0]
-            dates = pd.to_datetime(df[date_col])
+            dates = pd.to_datetime(df[date_col], format="ISO8601", errors="coerce")
             yearly_sums = (
                 df.assign(_year=dates.dt.year)
                 .groupby("_year", sort=True)[agg_numeric_cols]
@@ -306,12 +319,7 @@ def make_eda_baseline_workflow(
             and "_pr_" not in f"_{col.lower().replace(' ', '_')}_"
         ]
 
-        date_cols = df.select_dtypes(include=["datetime", "datetime64"]).columns.tolist()
-        if len(date_cols) == 0:
-            for col in df.select_dtypes(include=["object", "string"]).columns:
-                parsed = pd.to_datetime(df[col], errors="coerce")
-                if parsed.notna().all():
-                    date_cols.append(col)
+        date_cols = _get_date_columns(df)
 
         relationship_categorical_cols = [
             col for col in categorical_cols
@@ -356,7 +364,110 @@ def make_eda_baseline_workflow(
             "results": results,
         }
 
+    def analyze_timeseries_node(state: EDAState):
+        """Analyze timeseries if available.
+        
+        See profile_dataset_node and compute_aggregates_node for reference.
+        Store your results in results["analyze_timeseries"] and return
+        {"current_step": "analyze_timeseries", "results": results}.
+        """
+        logger.info("Analyzing timeseries")
+        df = pd.DataFrame.from_dict(state.get("dataframe"))
+        results = state.get("results", {})
 
+        numeric_cols = df.select_dtypes(include=["number"]).columns
+        agg_numeric_cols = [
+            col for col in numeric_cols
+            if "_per_" not in f"_{col.lower().replace(' ', '_')}_"
+            and "_pr_" not in f"_{col.lower().replace(' ', '_')}_"
+        ]
+
+        date_cols = _get_date_columns(df)
+
+        timeseries = {}
+
+        if len(date_cols) == 1:
+            date_col = date_cols[0]
+            dates = pd.to_datetime(df[date_col], format="ISO8601", errors="coerce")
+            unique_dates = dates.drop_duplicates().sort_values()
+
+            timeseries["date_column"] = date_col
+            timeseries["date_range"] = {
+                "start": str(dates.min().date()),
+                "end": str(dates.max().date()),
+                "days": int((dates.max() - dates.min()).days),
+            }
+            timeseries["unique_dates"] = int(unique_dates.shape[0])
+
+            if len(unique_dates) >= 2:
+                median_gap_days = unique_dates.diff().dropna().dt.days.median()
+                timeseries["median_gap_days"] = (
+                    float(median_gap_days) if pd.notna(median_gap_days) else None
+                )
+
+            monthly_groups = dates.dt.to_period("M").astype(str)
+            timeseries["monthly_record_count"] = (
+                df.groupby(monthly_groups, sort=True).size().to_dict()
+            )
+
+            if len(agg_numeric_cols) > 0:
+                monthly_totals = (
+                    df.groupby(monthly_groups, sort=True)[agg_numeric_cols]
+                    .sum()
+                )
+                monthly_pct_change = (
+                    monthly_totals.pct_change()
+                    .round(3)
+                    .dropna(how="all")
+                )
+                timeseries["monthly_pct_change"] = (
+                    monthly_pct_change.to_dict(orient="index")
+                    if not monthly_pct_change.empty else {}
+                )
+
+                strong_monthly_trends = []
+                if not monthly_pct_change.empty and len(monthly_pct_change) >= 2:
+                    for col in agg_numeric_cols:
+                        if col not in monthly_pct_change.columns:
+                            continue
+                        col_changes = monthly_pct_change[col].dropna()
+                        if len(col_changes) < 2:
+                            continue
+
+                        for month, change in col_changes.items():
+                            other_changes = col_changes.drop(month)
+                            if other_changes.empty:
+                                continue
+                            rest_mean = other_changes.mean()
+                            rest_std = other_changes.std()
+
+                            if pd.isna(rest_std) or rest_std == 0:
+                                is_strong = (
+                                    abs(change - rest_mean) >= 0.2
+                                    and abs(change - rest_mean) > abs(rest_mean)
+                                )
+                            else:
+                                z_vs_rest = (change - rest_mean) / rest_std
+                                is_strong = abs(z_vs_rest) >= 1.5
+
+                            if is_strong:
+                                direction = "upward" if change > rest_mean else "downward"
+                                strong_monthly_trends.append({
+                                    "month": month,
+                                    "column": col,
+                                    "pct_change": float(change),
+                                    "rest_mean_pct_change": float(rest_mean),
+                                    "direction": direction,
+                                })
+
+                timeseries["strong_monthly_trends"] = strong_monthly_trends
+
+        results["analyze_timeseries"] = timeseries
+
+        return {
+            "current_step": "analyze_timeseries",
+            "results": results,
+        }
     
     def extract_observations_node(state: EDAState):
         """Extract observations from the latest analysis results using LLM."""
@@ -438,6 +549,8 @@ def make_eda_baseline_workflow(
     workflow.add_node("extract_observations_3", extract_observations_node)
     workflow.add_node("analyze_relationships", analyze_relationships_node)
     workflow.add_node("extract_observations_4", extract_observations_node)
+    workflow.add_node("analyze_timeseries", analyze_timeseries_node)
+    workflow.add_node("extract_observations_5", extract_observations_node)
     workflow.add_node("synthesize_findings", synthesize_findings_node)
     
     workflow.set_entry_point("profile_dataset")
@@ -449,7 +562,9 @@ def make_eda_baseline_workflow(
     workflow.add_edge("compute_aggregates", "extract_observations_3")
     workflow.add_edge("extract_observations_3", "analyze_relationships")
     workflow.add_edge("analyze_relationships", "extract_observations_4")
-    workflow.add_edge("extract_observations_4", "synthesize_findings")
+    workflow.add_edge("extract_observations_4", "analyze_timeseries")
+    workflow.add_edge("analyze_timeseries", "extract_observations_5")
+    workflow.add_edge("extract_observations_5", "synthesize_findings")
     workflow.add_edge("synthesize_findings", END)
     
     app = workflow.compile(checkpointer=checkpointer, name=WORKFLOW_NAME)

@@ -28,5 +28,6 @@ Extract details on data quality into a concise list of observations. Actions ref
 - Focus on observations and possible actions on the data. Not on actions that are implied in the data (such as business decisions).
 - Structure the response to clearly link each observation to a result of data analysis. 
 - Observations should be specific and actionable, not generic.
-- Add units to values when available. Don't assume units. 
+- Add units to values when available. Don't assume units.
+- Never suggest the 'collection of more data' as an observation or action.
 - The response is maximum 5 sentences.
