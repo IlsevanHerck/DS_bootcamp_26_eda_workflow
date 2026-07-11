@@ -39,6 +39,19 @@ def _get_date_columns(df: pd.DataFrame) -> list[str]:
     return date_cols
 
 
+def _normalize_column_name(name: str) -> str:
+    return name.lower().replace(" ", "_")
+
+
+def _get_agg_numeric_columns(df: pd.DataFrame) -> list[str]:
+    numeric_cols = df.select_dtypes(include=["number"]).columns
+    return [
+        col for col in numeric_cols
+        if "_per_" not in f"_{_normalize_column_name(col)}_"
+        and "_pr_" not in f"_{_normalize_column_name(col)}_"
+    ]
+
+
 class EDAWorkflow:
     """
     Exploratory Data Analysis workflow that performs consistent, first-pass analysis of datasets.
@@ -234,6 +247,123 @@ def make_eda_baseline_workflow(
         
         return {
             "current_step": "analyze_missingness",
+            "results": results,
+        }
+
+    def validate_data_integrity_node(state: EDAState):
+        """Validate row integrity, logical consistency, and statistical outliers."""
+        logger.info("Validating data integrity")
+        df = pd.DataFrame.from_dict(state.get("dataframe"))
+        results = state.get("results", {})
+
+        total_rows = len(df)
+        agg_numeric_cols = _get_agg_numeric_columns(df)
+        numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+
+        duplicate_row_count = int(df.duplicated().sum())
+        integrity = {
+            "duplicate_rows": {
+                "count": duplicate_row_count,
+                "pct": round(duplicate_row_count / total_rows * 100, 2) if total_rows > 0 else 0,
+            },
+        }
+
+        key_cols = [
+            col for col in df.columns
+            if _normalize_column_name(col).endswith("_id")
+            or _normalize_column_name(col) == "id"
+        ]
+        duplicate_keys = {}
+        for col in key_cols:
+            duplicate_count = int(df[col].duplicated().sum())
+            if duplicate_count > 0:
+                duplicate_keys[col] = {
+                    "count": duplicate_count,
+                    "pct": round(duplicate_count / total_rows * 100, 2) if total_rows > 0 else 0,
+                }
+        integrity["duplicate_keys"] = duplicate_keys
+
+        qty_cols = [
+            col for col in numeric_cols
+            if any(token in _normalize_column_name(col) for token in ("quantity", "qty", "count"))
+        ]
+        rate_cols = [
+            col for col in numeric_cols
+            if "_per_" in f"_{_normalize_column_name(col)}_"
+            or "_pr_" in f"_{_normalize_column_name(col)}_"
+        ]
+        total_cols = [
+            col for col in agg_numeric_cols
+            if any(token in _normalize_column_name(col) for token in ("total", "spent", "amount", "sum"))
+        ]
+
+        consistency_violations = {}
+        if qty_cols and rate_cols and total_cols:
+            qty_col = qty_cols[0]
+            rate_col = rate_cols[0]
+            total_col = total_cols[0]
+            expected_total = df[qty_col] * df[rate_col]
+            violation_mask = (
+                expected_total.notna()
+                & df[total_col].notna()
+                & ((expected_total - df[total_col]).abs() > 1e-6)
+            )
+            violation_count = int(violation_mask.sum())
+            if violation_count > 0:
+                consistency_violations["quantity_rate_total_mismatch"] = {
+                    "quantity_column": qty_col,
+                    "rate_column": rate_col,
+                    "total_column": total_col,
+                    "count": violation_count,
+                    "pct": round(violation_count / total_rows * 100, 2) if total_rows > 0 else 0,
+                }
+        integrity["consistency_violations"] = consistency_violations
+
+        non_negative_tokens = ("quantity", "qty", "count", "price", "total", "spent", "amount")
+        invalid_ranges = {}
+        for col in numeric_cols:
+            if not any(token in _normalize_column_name(col) for token in non_negative_tokens):
+                continue
+            negative_count = int((df[col] < 0).sum())
+            if negative_count > 0:
+                invalid_ranges[col] = {
+                    "negative_count": negative_count,
+                    "pct": round(negative_count / total_rows * 100, 2) if total_rows > 0 else 0,
+                }
+        integrity["invalid_ranges"] = invalid_ranges
+
+        constant_columns = [
+            col for col in df.columns if df[col].nunique(dropna=False) <= 1
+        ]
+        integrity["constant_columns"] = constant_columns
+
+        statistical_outliers = {}
+        for col in agg_numeric_cols:
+            series = df[col].dropna()
+            if series.empty:
+                continue
+            q1 = series.quantile(0.25)
+            q3 = series.quantile(0.75)
+            iqr = q3 - q1
+            if iqr == 0:
+                continue
+            lower_bound = q1 - 1.5 * iqr
+            upper_bound = q3 + 1.5 * iqr
+            outlier_mask = (series < lower_bound) | (series > upper_bound)
+            outlier_count = int(outlier_mask.sum())
+            if outlier_count > 0:
+                statistical_outliers[col] = {
+                    "count": outlier_count,
+                    "pct": round(outlier_count / len(series) * 100, 2),
+                    "lower_bound": round(float(lower_bound), 3),
+                    "upper_bound": round(float(upper_bound), 3),
+                }
+        integrity["statistical_outliers"] = statistical_outliers
+
+        results["validate_data_integrity"] = integrity
+
+        return {
+            "current_step": "validate_data_integrity",
             "results": results,
         }
     
@@ -545,12 +675,14 @@ def make_eda_baseline_workflow(
     workflow.add_node("extract_observations_1", extract_observations_node)
     workflow.add_node("analyze_missingness", analyze_missingness_node)
     workflow.add_node("extract_observations_2", extract_observations_node)
-    workflow.add_node("compute_aggregates", compute_aggregates_node)
+    workflow.add_node("validate_data_integrity", validate_data_integrity_node)
     workflow.add_node("extract_observations_3", extract_observations_node)
-    workflow.add_node("analyze_relationships", analyze_relationships_node)
+    workflow.add_node("compute_aggregates", compute_aggregates_node)
     workflow.add_node("extract_observations_4", extract_observations_node)
-    workflow.add_node("analyze_timeseries", analyze_timeseries_node)
+    workflow.add_node("analyze_relationships", analyze_relationships_node)
     workflow.add_node("extract_observations_5", extract_observations_node)
+    workflow.add_node("analyze_timeseries", analyze_timeseries_node)
+    workflow.add_node("extract_observations_6", extract_observations_node)
     workflow.add_node("synthesize_findings", synthesize_findings_node)
     
     workflow.set_entry_point("profile_dataset")
@@ -558,13 +690,15 @@ def make_eda_baseline_workflow(
     workflow.add_edge("profile_dataset", "extract_observations_1")
     workflow.add_edge("extract_observations_1", "analyze_missingness")
     workflow.add_edge("analyze_missingness", "extract_observations_2")
-    workflow.add_edge("extract_observations_2", "compute_aggregates")
-    workflow.add_edge("compute_aggregates", "extract_observations_3")
-    workflow.add_edge("extract_observations_3", "analyze_relationships")
-    workflow.add_edge("analyze_relationships", "extract_observations_4")
-    workflow.add_edge("extract_observations_4", "analyze_timeseries")
-    workflow.add_edge("analyze_timeseries", "extract_observations_5")
-    workflow.add_edge("extract_observations_5", "synthesize_findings")
+    workflow.add_edge("extract_observations_2", "validate_data_integrity")
+    workflow.add_edge("validate_data_integrity", "extract_observations_3")
+    workflow.add_edge("extract_observations_3", "compute_aggregates")
+    workflow.add_edge("compute_aggregates", "extract_observations_4")
+    workflow.add_edge("extract_observations_4", "analyze_relationships")
+    workflow.add_edge("analyze_relationships", "extract_observations_5")
+    workflow.add_edge("extract_observations_5", "analyze_timeseries")
+    workflow.add_edge("analyze_timeseries", "extract_observations_6")
+    workflow.add_edge("extract_observations_6", "synthesize_findings")
     workflow.add_edge("synthesize_findings", END)
     
     app = workflow.compile(checkpointer=checkpointer, name=WORKFLOW_NAME)
