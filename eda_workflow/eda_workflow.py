@@ -294,6 +294,69 @@ def make_eda_baseline_workflow(
         {"current_step": "analyze_relationships", "results": results}.
         """
         logger.info("Analyzing relationships")
+        df = pd.DataFrame.from_dict(state.get("dataframe"))
+        results = state.get("results", {})
+
+        numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+        categorical_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+
+        agg_numeric_cols = [
+            col for col in numeric_cols
+            if "_per_" not in f"_{col.lower().replace(' ', '_')}_"
+            and "_pr_" not in f"_{col.lower().replace(' ', '_')}_"
+        ]
+
+        date_cols = df.select_dtypes(include=["datetime", "datetime64"]).columns.tolist()
+        if len(date_cols) == 0:
+            for col in df.select_dtypes(include=["object", "string"]).columns:
+                parsed = pd.to_datetime(df[col], errors="coerce")
+                if parsed.notna().all():
+                    date_cols.append(col)
+
+        relationship_categorical_cols = [
+            col for col in categorical_cols
+            if col not in date_cols and df[col].nunique() <= 20
+        ]
+
+        relationships = {}
+
+        if len(agg_numeric_cols) >= 2:
+            correlation_matrix = df[agg_numeric_cols].corr().round(3)
+            numeric_correlations = correlation_matrix.to_dict()
+            relationships["numeric_correlations"] = numeric_correlations
+
+            strong_correlations = []
+            for i, col_a in enumerate(agg_numeric_cols):
+                for col_b in agg_numeric_cols[i + 1:]:
+                    coefficient = correlation_matrix.loc[col_a, col_b]
+                    if pd.notna(coefficient) and abs(coefficient) >= 0.5:
+                        strong_correlations.append({
+                            "column_a": col_a,
+                            "column_b": col_b,
+                            "correlation": float(coefficient),
+                        })
+            relationships["strong_correlations"] = strong_correlations
+
+        if relationship_categorical_cols and agg_numeric_cols:
+            categorical_numeric_means = {}
+            for cat_col in relationship_categorical_cols:
+                group_means = (
+                    df.groupby(cat_col, sort=False)[agg_numeric_cols]
+                    .mean()
+                    .round(3)
+                    .to_dict(orient="index")
+                )
+                categorical_numeric_means[cat_col] = group_means
+            relationships["categorical_numeric_means"] = categorical_numeric_means
+
+        results["analyze_relationships"] = relationships
+
+        return {
+            "current_step": "analyze_relationships",
+            "results": results,
+        }
+
+
     
     def extract_observations_node(state: EDAState):
         """Extract observations from the latest analysis results using LLM."""
