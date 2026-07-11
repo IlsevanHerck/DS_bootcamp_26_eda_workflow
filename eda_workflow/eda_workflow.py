@@ -229,6 +229,60 @@ def make_eda_baseline_workflow(
         {"current_step": "compute_aggregates", "results": results}.
         """
         logger.info("Computing aggregates")
+        df = pd.DataFrame.from_dict(state.get("dataframe"))
+        results = state.get("results", {})
+
+        numeric_cols = df.select_dtypes(include=["number"]).columns
+        agg_numeric_cols = [
+            col for col in numeric_cols
+            if "_per_" not in f"_{col.lower().replace(' ', '_')}_"
+            and "_pr_" not in f"_{col.lower().replace(' ', '_')}_"
+        ]
+        numeric_sums = (
+            df[agg_numeric_cols].sum().to_dict() if len(agg_numeric_cols) > 0 else {}
+        )
+
+        df_aggregates = {}
+        df_aggregates["numeric_sums"] = numeric_sums
+
+        date_cols = df.select_dtypes(include=["datetime", "datetime64"]).columns.tolist()
+        if len(date_cols) == 0:
+            for col in df.select_dtypes(include=["object", "string"]).columns:
+                parsed = pd.to_datetime(df[col], errors="coerce")
+                if parsed.notna().all():
+                    date_cols.append(col)
+
+        if len(date_cols) == 1 and len(agg_numeric_cols) > 0:
+            date_col = date_cols[0]
+            dates = pd.to_datetime(df[date_col])
+            yearly_sums = (
+                df.assign(_year=dates.dt.year)
+                .groupby("_year", sort=True)[agg_numeric_cols]
+                .sum()
+                .to_dict(orient="index")
+            )
+            quarterly_sums = (
+                df.assign(_quarter=dates.dt.to_period("Q").astype(str))
+                .groupby("_quarter", sort=True)[agg_numeric_cols]
+                .sum()
+                .to_dict(orient="index")
+            )
+            monthly_sums = (
+                df.assign(_month=dates.dt.to_period("M").astype(str))
+                .groupby("_month", sort=True)[agg_numeric_cols]
+                .sum()
+                .to_dict(orient="index")
+            )
+            df_aggregates["yearly_numeric_sums"] = yearly_sums
+            df_aggregates["quarterly_numeric_sums"] = quarterly_sums
+            df_aggregates["monthly_numeric_sums"] = monthly_sums
+        
+        results["compute_aggregates"] = df_aggregates
+        
+        return {
+            "current_step": "compute_aggregates",
+            "results": results,
+        }
     
     def analyze_relationships_node(state: EDAState):
         """Analyze relationships between variables.
